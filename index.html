@@ -1267,7 +1267,7 @@ body.edit .pd-rv{opacity:1!important;transform:none!important}
       </div>
       <h2>这是一份私密作品集</h2>
       <p>请输入密码以查看内容。<br/>如需访问，请联系作品集所有者获取。</p>
-      <input id="gateInput" type="password" autocomplete="off" spellcheck="false" placeholder="密码" />
+      <input id="gateInput" type="password" autocomplete="new-password" name="access-code" readonly spellcheck="false" placeholder="密码" />
       <button class="gbtn" id="gateBtn" type="button">进入</button>
       <div class="gerr" id="gateErr"></div>
       <div class="gfine" id="gateFine">Protected</div>
@@ -4605,6 +4605,11 @@ function bindGate(){
   btn.addEventListener("click", submit);
   input.addEventListener("keydown", e=>{ if(e.key === "Enter"){ e.preventDefault(); submit(); } });
   setTimeout(()=>{ try{ input.focus(); }catch(e){} }, 80);
+  // 防自动填充：输入框初始 readonly，首次点击/触摸/按键时恢复
+  const unRO = ()=>{ if(input.readOnly){ input.readOnly = false; setTimeout(()=>{ try{ input.focus(); }catch(e){} }, 0); } };
+  input.addEventListener("pointerdown", unRO);
+  input.addEventListener("touchstart", unRO, {passive:true});
+  input.addEventListener("keydown", unRO, true);
 }
 
 /* ---- 方案 B：密码门视频背景（不改动视频，水印/字幕由 CSS 遮罩盖住） ---- */
