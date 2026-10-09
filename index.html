@@ -2748,6 +2748,7 @@ function bindEditorUI(){
       const wrap = edWrap;
       const start = wrap.getBoundingClientRect();
       const sx = e.clientX, sy = e.clientY;
+      let lastFree = false;
       document.body.classList.add("ie-resizing");
       const onMove = ev=>{
         const dx = ev.clientX - sx, dy = ev.clientY - sy;
@@ -2756,7 +2757,22 @@ function bindEditorUI(){
         if(dir.indexOf("s") >= 0) hgt = start.height + dy;
         if(dir.indexOf("w") >= 0) w = start.width - dx;
         if(dir.indexOf("n") >= 0) hgt = start.height - dy;
-        const MIN = 40; w = Math.max(MIN, w); hgt = Math.max(MIN, hgt);
+        /* 下限 40px 是像素级的"别把图缩没了"，但比例锁定后它会变成
+           实际卡点：往上/往左拖时，高度先撞 40px 就停住。改成比例感知的下限——
+           至少保留原宽度的 1/4，避免任何方向都能继续拖。 */
+        const MIN = Math.max(40, Math.round(start.width / 4));
+        w = Math.max(MIN, w); hgt = Math.max(MIN, hgt);
+        /* 角点缩放保持原图比例（PS/浏览器图片框的常规行为）。
+           不锁的话用户往上/往左拖时高度先到MIN=40 就卡住了，
+           看起来"被限制住"（用户 2026-10-09 反馈）。
+           只有按住 Shift 拖角点才允许自由改变比例（宽高自由）。 */
+        const free = ev.shiftKey;
+        if(!free && start.height > 0){
+          const ratio = start.width / start.height;      // 以"开始时"的比例为准，避免累计漂移
+          if(dir.indexOf("e") >= 0 || dir.indexOf("w") >= 0) hgt = Math.max(MIN, w / ratio);
+          else                                        w = Math.max(MIN, hgt * ratio);
+        }
+        lastFree = !!ev.shiftKey;
         wrap.style.width = w + "px"; wrap.style.height = hgt + "px"; wrap.style.aspectRatio = "auto";
         positionEditor();
         ed.querySelector('[data-role="canvas"] i').textContent = Math.round(w)+"×"+Math.round(hgt);
@@ -2774,8 +2790,10 @@ function bindEditorUI(){
         let ratio = 0;
         if(base && base.w && base.h) ratio = base.h / base.w;
         else if(prev && prev.w && prev.h) ratio = prev.h / prev.w;
+        /* 记录尺寸：默认按原图比例锁高度；若这次是 Shift+拖角（自由缩放），
+           就采纳实际宽高。lastFree 由上面的 onMove 设置。 */
         const nw = Math.max(24, Math.round(nr.width));
-        const nh = ratio > 0 ? Math.max(24, Math.round(nw * ratio)) : Math.round(nr.height);
+        const nh = (lastFree || !(ratio > 0)) ? Math.round(nr.height) : Math.max(24, Math.round(nw * ratio));
         state.sizes = state.sizes || {};
         state.sizes[edKey] = { w: nw, h: nh };
         wrap.style.width = nw + "px";
