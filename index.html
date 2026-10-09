@@ -47,7 +47,12 @@
   .container{max-width:var(--board);margin:0 auto;padding:0 28px}
   /* 各区块自身也是画板：限宽居中 + 溢出裁切 */
   .topbar,.identity,.nav,section{width:100%;max-width:var(--board);margin-left:auto;margin-right:auto}
+  /* 画板裁切只在【浏览态】生效。
+     编辑态必须放开 —— 否则超出边界的图片会被裁掉一半，用户既框选不到、
+     也拖不动（最严重的一张超出画板 1502px，整个右半截都在界外）。
+     这正是用户 2026-10-09 反馈的"图片被固定限制、不在可编辑范围内"。 */
   .section,.featured,.contact{overflow:hidden}
+  body.edit .section,body.edit .featured,body.edit .contact{overflow:visible}
   /* 浏览器缩放（Ctrl + -）会让 CSS 视口成倍变宽，而 1240px 上限不变 →
      内容只占视口一小半（50% 缩放时仅 32%），右侧大片空白（用户 2026-10-08 反馈）。
      解决：上限跟随视口 —— 用 vw 让它随缩放一起放大，同时保留一个"绝对上限"
