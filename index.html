@@ -1648,6 +1648,76 @@ const SEED = {
 };
 
 const STORAGE_KEY = "yuhelin-studio-data-v1";
+
+/* ==========================================================================
+   存储层：IndexedDB 优先，localStorage 降级
+   为什么换：localStorage 每个站点通常只有 ~5MB，而作品集内容（含 base64 图片）
+   轻松到 400KB+，加上编辑过程中的副本很容易撞上限。一旦写不进去，
+   localStorage.setItem 会静默保留旧值 → 用户以为保存了，刷新后内容回退。
+   真实事故：2026-10-09 用户的图与位置被反复"还原"，根因就是这里。
+   IndexedDB 配额通常是几百 MB，且是异步写入，不会阻塞交互。
+   ========================================================================== */
+let _lastSavedLen = 0, storeSaveError = "";
+const IDB_NAME = "yuhelin-studio", IDB_STORE = "kv";
+let _idb = null, _idbFailed = false;
+function idbOpen(){
+  if(_idb) return Promise.resolve(_idb);
+  if(_idbFailed || typeof indexedDB === "undefined") return Promise.reject(new Error("no idb"));
+  return new Promise((res, rej)=>{
+    let rq;
+    try{ rq = indexedDB.open(IDB_NAME, 1); }catch(e){ _idbFailed = true; return rej(e); }
+    rq.onupgradeneeded = ()=>{ try{ rq.result.createObjectStore(IDB_STORE); }catch(e){} };
+    rq.onsuccess = ()=>{ _idb = rq.result; res(_idb); };
+    rq.onerror = ()=>{ _idbFailed = true; rej(rq.error || new Error("idb open failed")); };
+  });
+}
+function idbGet(key){
+  return idbOpen().then(db=>new Promise((res, rej)=>{
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const rq = tx.objectStore(IDB_STORE).get(key);
+    rq.onsuccess = ()=> res(rq.result);
+    rq.onerror = ()=> rej(rq.error);
+  }));
+}
+function idbSet(key, val){
+  return idbOpen().then(db=>new Promise((res, rej)=>{
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put(val, key);
+    tx.oncomplete = ()=> res(true);
+    tx.onerror = ()=> rej(tx.error);
+    tx.onabort = ()=> rej(tx.error);
+  }));
+}
+/* 统一读：先 IndexedDB，没有再回落 localStorage（兼容旧数据） */
+function storeGet(key){
+  return idbGet(key).then(v=> v == null ? (localStorage.getItem(key) || null) : v)
+    .catch(()=> localStorage.getItem(key) || null);
+}
+/* 统一写：优先 IndexedDB；失败或不存在才用 localStorage */
+function storeSet(key, val){
+  return idbSet(key, val)
+    .then(()=> { try{ localStorage.setItem(key, val); }catch(e){} return "idb"; })
+    .catch(()=>{ localStorage.setItem(key, val); return "ls"; });
+}
+/* 启动时把还留在 localStorage 里的旧内容搬进 IndexedDB，并清掉 localStorage 副本腾空间 */
+function storeMigrate(){
+  /* 启动即把内容搬进 IndexedDB，然后清掉 localStorage 里的副本 —— 双份会让
+     本就紧张的 5MB 配额雪上加霜，也是"存不进去"的直接原因。
+     localStorage 只保留一个极小的标记键，用于辨认"迁移过"。 */
+  return idbOpen().then(()=> idbGet(STORAGE_KEY)).then(idbVal=>{
+    const ls = (function(){ try{ return localStorage.getItem(STORAGE_KEY) || ""; }catch(e){ return ""; } })();
+    const keep = Math.max(idbVal ? idbVal.length : 0, ls.length);
+    if(keep < 50000) return null;
+    const src = (idbVal && idbVal.length >= ls.length) ? idbVal : ls;
+    return idbSet(STORAGE_KEY, src).then(()=>{
+      try{
+        localStorage.setItem("yuhelin-store", "idb:" + src.length);
+        localStorage.removeItem(STORAGE_KEY);       // 腾出配额
+      }catch(e){}
+      return src.length;
+    }).catch(()=>null);
+  }).catch(()=>null);
+}
 let state = loadState();
 let editMode = false;
 let dirty = false;
@@ -1760,16 +1830,30 @@ function migrateCutFit(st){
   });
 }
 function loadState(){
+  /* 先用 localStorage 里的（如果有）同步起步，避免首屏空白 */
+  let raw = null;
+  try{ raw = localStorage.getItem(STORAGE_KEY); }catch(e){}
+  /* 同时异步查 IndexedDB：如果那里的更新（体量通常更大），用它覆盖 */
+  storeGet(STORAGE_KEY).then(v=>{
+    if(!v || !editMode) return;
+    if(v.length <= (raw||"").length) return;
+    try{
+      const st2 = normalizeState(JSON.parse(v));
+      state = st2;
+      applyTextLayout();
+      updateTags();
+      console.info("[store] 已从 IndexedDB 载入更新内容（" + v.length + " 字符）");
+    }catch(e){}
+  }).catch(()=>{});
   try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if(!raw) return deepClone(SEED);
+    if(!raw) raw = null;
     const st = normalizeState(JSON.parse(raw));
     /* 迁移（去掉历史重复图副本）会让内容明显变小 —— 立刻写回，
        把本机存储空间真正还回来。否则内存里是小份、磁盘上还压着旧的大份，
        用户的浏览器会一直报"空间已满"，怎么点都存不进去。写失败也无所谓，不能影响加载。 */
     try{
       const now = JSON.stringify(st);
-      if(now.length < raw.length * 0.92) localStorage.setItem(STORAGE_KEY, now);
+      if(now.length < raw.length * 0.92) storeSet(STORAGE_KEY, now);
     }catch(e){}
     return st;
   }catch{ return deepClone(SEED); }
@@ -1778,7 +1862,25 @@ function deepClone(o){ return JSON.parse(JSON.stringify(o)); }
 
 /* 显式保存：写入 localStorage，并刷新「上次保存」基线（供 ↺ 重置与未保存提示使用） */
 function saveState(){
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  const json = JSON.stringify(state);
+  _lastSavedLen = json.length;
+  storeSaveError = "";
+  /* storeSet 内部走 IndexedDB（异步）。如果它失败，localStorage 会被当降级路径；
+     两条都失败才算真存不上。必须给 promise 挂 catch —— 否则会变成未处理异常，
+     在浏览器控制台里炸一条红，用户完全不知道出了什么事（2026-10-09 实测）。 */
+  try{
+    const p = storeSet(STORAGE_KEY, json);
+    if(p && typeof p.catch === "function"){
+      p.catch(()=>{
+        try{
+          localStorage.setItem(STORAGE_KEY, json);
+        }catch(e2){
+          storeSaveError = humanErr(e2);
+          queueSave();               // 让状态灯保持"未保存"，不假装成功
+        }
+      });
+    }
+  }catch(e){ storeSaveError = humanErr(e); }
   savedBaseline = JSON.parse(JSON.stringify(state));
   dirty = false;
   refreshSaveBtn();
@@ -5196,8 +5298,18 @@ async function onSaveClick(){
     await withTimeout(ghPutFile(html), 180000, "上传超时（超过 3 分钟）");
     saveBusy = false;
     saveStageEnd();
+    /* 关键：显示的是"实际存进浏览器 / 传上线的字节数"，不是内存里的 state。
+       之前的 bug：这里算JSON.stringify(state)，而 state 可能已被残缺数据污染，
+       于是提示"内容 350 KB"其实传的是 121KB —— 用户以为成功了，其实没存上。
+       现在 _lastSavedLen 由 saveState() 写入，是真正落盘/上传的那份。 */
+    const shownKB = Math.round((_lastSavedLen || JSON.stringify(state).length) / 1024);
     saveToastShow("已保存并发布 ✓",
-      "线上约 1 分钟生效 · 本次发布 " + Math.round((Date.now() - t0) / 1000) + " 秒 · 内容 " + Math.round(JSON.stringify(state).length / 1024) + " KB", "ok");
+      "线上约 1 分钟生效 · 本次发布 " + Math.round((Date.now() - t0) / 1000) + " 秒 · 内容 " + shownKB + " KB", "ok");
+    /* 只有明显小到"内容几乎为空"才告警。阈值 80KB：
+       残缺内容的密文约 121KB，完整内容 370KB+，用 80 能抓住"真的空了"，
+       又不会把"内容较少但完整"误判成失败。 */
+    if(shownKB < 80){ setTimeout(()=> saveToastShow("⚠️ 内容体积异常小，可能没存上",
+      "只上传了 " + shownKB + " KB，完整内容通常在 300 KB 以上，请检查是否被清空", "err"), 2200); }
     const v = document.getElementById("saveVerify");
     if(v) v.href = location.href.split("#")[0] + "?v=" + Date.now();   // 随机参数绕开缓存，方便当场核对
     flashStatus("已发布 · 约 1 分钟后线上生效", "saved");
@@ -7616,6 +7728,7 @@ document.addEventListener("DOMContentLoaded", ()=>{
   bindToolbar();
   bindMarquee();
   bindSelectKeys();
+  storeMigrate();   // 把localStorage 里的内容搬进 IndexedDB 并清掉副本，腾出配额
   bindImageEditor();
   bindTextEditor();
   bindLeftbar();
