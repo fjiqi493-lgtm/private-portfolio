@@ -2341,6 +2341,14 @@ function fixParent(wrap, key){
   // 父容器固定尺寸 + 可见溢出，允许边框自由越界
   parent.style.overflow = "visible";
   if(pcs.aspectRatio && pcs.aspectRatio !== "auto") parent.style.aspectRatio = "auto";
+  /* ⚠️ 关键：CSS 里可能给这个元素自己写了 aspect-ratio（如 .featured figure 的 4/5）。
+     它会盖过 JS 写的 width/height，把用户调好的比例强行掰回 4/5 ——
+     上传后再打开，构图就变了（2026-10-12 用户反馈"布局比例又变了"）。
+     只要用户调过尺寸（state.sizes 有记录），就必须把元素自身的 aspect-ratio 关掉。 */
+  const sz0 = state.sizes && state.sizes[key];
+  if(sz0 && sz0.w && sz0.h && wrap.style.aspectRatio !== "auto"){
+    wrap.style.aspectRatio = "auto";
+  }
   const sz = state.sizes && state.sizes[key];
   if(sz && sz.w && sz.h){
     /* 纯固定像素 —— 浏览器缩放（Ctrl +-）时 CSS px 会整体等比缩放，
@@ -2432,6 +2440,9 @@ function applyFrameStyles(wrap, key){
   const inner = innerOf(wrap);
   if(!inner) return;
   const sz = state.sizes && state.sizes[key];
+  /* 只要用户调过尺寸，就关掉元素自身的 aspect-ratio —— 否则 CSS 的 4/5 会盖过
+     用户调好的 width/height，每次渲染都把比例掰回去（上传后构图变化的根因）。 */
+  if(sz && sz.w && sz.h) wrap.style.aspectRatio = "auto";
   const fr = (state.frames && state.frames[key]) || {};
   const tx = (state.imgTx && state.imgTx[key]) || {};
 
@@ -2770,7 +2781,18 @@ function bindEditorUI(){
       const start = wrap.getBoundingClientRect();
       const fr0 = (state.frames && state.frames[edKey]) || { x:0, y:0 };
       const sx = e.clientX, sy = e.clientY;
-      const ratio0 = start.height > 0 ? start.width / start.height : 0;   // 拖拽开始时的比例，角点缩放用它
+      /* 角点等比必须用【原图真实比例】(naturalWidth/naturalHeight)，
+         不能用"当前框比例" —— 当前框可能已被 CSS aspect-ratio 或此前的误操作带偏，
+         按它锁会把横图越拖越竖，cover 后构图全毁（2026-10-12 用户反馈）。 */
+      const innerEl = innerOf(wrap);
+      const natSrc = currentImageSrc(innerEl);
+      let ratio0 = start.height > 0 ? start.width / start.height : 0;   // 兜底：当前框比例
+      const probe = new Image();
+      if(natSrc){
+        probe.onload = ()=>{ if(probe.naturalWidth && probe.naturalHeight) winRatio = probe.naturalWidth / probe.naturalHeight; };
+        probe.src = natSrc;
+      }
+      let winRatio = 0;
       document.body.classList.add("ie-resizing");
       const MIN = 40;
       const onMove = ev=>{
@@ -2780,10 +2802,11 @@ function bindEditorUI(){
         if(dir.indexOf("s") >= 0) hgt = start.height + dy;
         if(dir.indexOf("w") >= 0) w = start.width - dx;
         if(dir.indexOf("n") >= 0) hgt = start.height - dy;
-        if(isCorner && !ev.shiftKey && ratio0 > 0){
-          // 角点等比：以拖拽开始时的比例为基准，宽为主时高跟随
-          if(dir.indexOf("e") >= 0 || dir.indexOf("w") >= 0) hgt = w / ratio0;
-          else                                               w = hgt * ratio0;
+        const useRatio = (isCorner && !ev.shiftKey) ? (winRatio > 0 ? winRatio : ratio0) : 0;
+        if(useRatio > 0){
+          // 角点等比：按【原图真实比例】，宽为主时高跟随
+          if(dir.indexOf("e") >= 0 || dir.indexOf("w") >= 0) hgt = w / useRatio;
+          else                                               w = hgt * useRatio;
         }
         w = Math.max(MIN, w); hgt = Math.max(MIN, hgt);
         // 位置补偿：拖西边 → 右边缘应固定，框体 x 跟着鼠标走；拖北边同理
