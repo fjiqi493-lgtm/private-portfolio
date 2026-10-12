@@ -1816,8 +1816,12 @@ function migrateImageRatio(st){
     const sz = st.sizes[k]; if(!sz || !sz.w || !sz.h) return;
     const base = st.imgBases[k];
     if(!base) return;
-    if(Math.abs(base.w - sz.w) > 3 || Math.abs(base.h - sz.h) > 3){
-      base.w = sz.w; base.h = sz.h;
+    /* base × scale 必须正好覆盖显示框 → base = sizes ÷ scale */
+    const sc = ((st.imgTx || {})[k] || {}).scale || 1;
+    const safe = sc > 0.01 ? sc : 1;
+    const wantW = Math.round(sz.w / safe), wantH = Math.round(sz.h / safe);
+    if(Math.abs(base.w - wantW) > 3 || Math.abs(base.h - wantH) > 3){
+      base.w = wantW; base.h = wantH;
     }
   });
 }
@@ -2405,8 +2409,14 @@ function computeImgBase(wrap, key, fw, fh){
     let base;
     if(!n || !n.w || !n.h) base = { w: Math.round(fw), h: Math.round(fh) };
     else{
-      const cover = Math.max(fw / n.w, fh / n.h);
-      base = { w: Math.round(n.w * cover), h: Math.round(n.h * cover) };
+      /* ⚠️ 基准尺寸的定义是"scale=1 时图片正好填满显示框"，所以必须按【显示框】算，
+         不是按原图算。按原图算会得到 1458×815 这种比框大 2.3 倍的基准，
+         再乘上用户的 imgTx.scale(1.21) → 图片被放到 1764×986，被框 cover 裁掉一大半，
+         用户在编辑器里调好的构图，一上传就毁（2026-10-12 线上事故）。
+         正确做法：基准 = 显示框 ÷ 当前缩放，这样 base × scale 始终正好覆盖框。 */
+      const sc = ((state.imgTx || {})[key] || {}).scale || 1;
+      const safe = sc > 0.01 ? sc : 1;
+      base = { w: Math.round(fw / safe), h: Math.round(fh / safe) };
     }
     state.imgBases = state.imgBases || {};
     state.imgBases[key] = base;
