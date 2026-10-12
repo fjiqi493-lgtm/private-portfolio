@@ -1586,6 +1586,7 @@ const SEED = {
   imgTx: {},
   // image base render size at scale=1, decoupled from frame size
   imgBases: {},
+  imgNaturals: {},   // 原图真实尺寸 {w,h}：用于把"被带歪的显示框比例"纠回原图比例
   // text box: free position + width (range)  -> {x,y,w,disp}
   textBox: {},
   // text style overrides -> {size,family,weight,style,spacing,lineHeight,align,color}
@@ -1822,6 +1823,25 @@ function migrateImageRatio(st){
     const wantW = Math.round(sz.w / safe), wantH = Math.round(sz.h / safe);
     if(Math.abs(base.w - wantW) > 3 || Math.abs(base.h - wantH) > 3){
       base.w = wantW; base.h = wantH;
+    }
+    /* 若显示框比例与原图比例明显不符（>12%），说明这个框被此前的
+       "按当前框比例锁角点"的 bug 带歪了 —— 横图被存成竖框，cover 后构图全毁。
+       这里按原图比例纠正：宽度不变，高度按 宽 × 原图高/原图宽 重算。
+       （只纠正"被bug 带歪"的，用户主动拖成的异常比例不动 —— 用 imgTx 是否存在来判断：
+        用户主动调整过图片变换时，说明他在精细控制，不干预。） */
+    /* 一次性纠正（2026-10-12）：featuredImg 被此前的 bug 存成了竖框 637×815，
+       而原图是 1800×1006 横图 —— cover 后横图被裁掉 56%，构图全毁。
+       这里直接按原图比例把它纠回 637×357（宽不变，高度按原图比例）。
+       只此一次，下次加载 nat 已记录就走通用逻辑。 */
+    if(k === "images.featuredImg" && !st.__fixedFeatured){
+      st.__fixedFeatured = 1;
+      sz.h = Math.round(sz.w * 1006 / 1800);
+    }
+    const tx0 = (st.imgTx || {})[k];
+    const nat = st.imgNaturals && st.imgNaturals[k];
+    if(!tx0 && nat && nat.w && nat.h){
+      const wantH2 = Math.round(sz.w * nat.h / nat.w);
+      if(Math.abs(sz.h - wantH2) > Math.max(6, sz.h * 0.12)) sz.h = wantH2;
     }
   });
 }
