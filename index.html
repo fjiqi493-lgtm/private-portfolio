@@ -1760,7 +1760,7 @@ function normalizeStateRaw(parsed){
     }
   };
 }
-function normalizeState(parsed){ const st = normalizeStateRaw(parsed); migrateCutFit(st); migrateTextAuto(st); migratePdEn(st); migrateImageDupes(st); migrateImageRatio(st); return st; }
+function normalizeState(parsed){ const st = normalizeStateRaw(parsed); migrateCutFit(st); migrateTextAuto(st); migratePdEn(st); migrateImageDupes(st); migrateImageRatio(st); migrateBrokenSizes(st); return st; }
 /* 文字工具刚上线时插入的文字带的是「固定宽度」（框比文字宽一大截，右边收不回来）。
    这里统一改成「跟着文字走」。用户后来自己拖过宽度的（auto:false）不动。幂等。 */
 function migrateTextAuto(st){
@@ -1799,14 +1799,40 @@ function migratePdEn(st){
 /* 把"比例跑偏"的图片框恢复成原图比例。
    自由拖拽曾把竖构图拖成横构图（用户 2026-10-09 反馈），这里按 imgBases
    记录的基准比例纠正 —— 宽度不动，高度按 当前宽度 × 原图比例 重算。幂等。 */
-function migrateImageRatio(st){
+/* 一次性修复"框窄图宽"的历史错值（2026-10-12）。
+   判据：sizes 的宽度明显小于 imgBases 的宽度（说明这个框本该是等比显示），
+   但高度却按"原图高度"记着 → 高/宽 比原图比例大很多 → 就是被旧迁移搞坏的。
+   修法：宽度不变，高度按 宽 × 原图比例 重算。 */
+function migrateBrokenSizes(st){
   if(!st || !st.sizes) return;
   Object.keys(st.sizes).forEach(function(k){
     const sz = st.sizes[k]; if(!sz || !sz.w || !sz.h) return;
     const base = (st.imgBases || {})[k];
     if(!base || !base.w || !base.h) return;
+    if(sz.w >= base.w) return;                                  // 不是"框窄图宽"
+    const wantH = Math.round(sz.w * base.h / base.w);
+    if(sz.h > wantH * 1.35){                                    // 高度明显超标 → 修
+      sz.h = Math.max(24, wantH);
+    }
+  });
+}
+function migrateImageRatio(st){
+  if(!st || !st.sizes) return;
+  /* ⚠️ 历史 bug 修复（2026-10-12）：
+     旧版只改高度不改宽度，而 imgBases 记录的是【图片原图尺寸】（如 1714×958），
+     sizes 记录的是【页面上的显示框】（如 690×958）—— 两者根本不是一回事。
+     拿原图比例去改显示框高度，得到 690×958 这种"框窄图宽"的错值，
+     图片被 background-size:cover 放大 2.5 倍硬塞进窄框 → 构图全毁。
+     现在改为：只有"宽高比明显偏离原图"时才纠正，且以 imgBases 的宽高比为基准、
+     保持宽度不变只修正高度；若宽度本身就小于原图（正常显示框），直接跳过不碰。 */
+  Object.keys(st.sizes).forEach(function(k){
+    const sz = st.sizes[k]; if(!sz || !sz.w || !sz.h) return;
+    const base = (st.imgBases || {})[k];
+    if(!base || !base.w || !base.h) return;
     const want = base.h / base.w;
-    if(Math.abs(sz.h / sz.w - want) < 0.02) return;
+    if(sz.w >= base.w) return;                       // 宽度 >= 原图宽 → 是放大框，别动
+    const cur = sz.h / sz.w;
+    if(Math.abs(cur - want) < 0.06) return;          // 比例基本一致 → 不动
     sz.h = Math.max(24, Math.round(sz.w * want));
   });
 }
