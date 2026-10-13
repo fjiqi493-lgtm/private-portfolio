@@ -1805,22 +1805,20 @@ function migratePdEn(st){
    sizes 是用户在页面上调好的显示框，imgBases 是图片基准，两者用途不同，
    任何自动互改都是帮倒忙。要改让用户在编辑器里拖。 */
 function migrateImageRatio(st){
-  /* ⚠️ 加载时【绝不修改 sizes】（2026-10-13）。
-     sizes 是用户在编辑器里调好的显示框，是用户的构图。
-     旧版在加载时按 imgBases/imgNaturals 去"纠正"它，而 imgBases 本身可能是
-     异步写入的、时序不定 → 每次刷新纠正结果都不同 → 位置随机变（用户反馈）。
-     现在这里只做一件幂等且纯粹的事：保证 imgBases = sizes ÷ scale，
-     让 base × scale 正好覆盖显示框。sizes 一个字都不碰。 */
+  /* 只保证 imgBases 符合它的定义（scale=1 时 cover 填满框），
+     绝不碰 sizes / imgTx —— 那是用户的构图和缩放。
+     imgNaturals 没记录的图跳过（等 computeImgBase 下次补）。 */
   if(!st || !st.sizes) return;
   st.imgBases = st.imgBases || {};
+  st.imgNaturals = st.imgNaturals || {};
   Object.keys(st.sizes).forEach(function(k){
     const sz = st.sizes[k]; if(!sz || !sz.w || !sz.h) return;
-    const base = st.imgBases[k]; if(!base) return;
-    const sc = ((st.imgTx || {})[k] || {}).scale || 1;
-    const safe = sc > 0.01 ? sc : 1;
-    const wantW = Math.round(sz.w / safe), wantH = Math.round(sz.h / safe);
-    if(Math.abs(base.w - wantW) > 3 || Math.abs(base.h - wantH) > 3){
-      base.w = wantW; base.h = wantH;
+    const nat = st.imgNaturals[k]; if(!nat || !nat.w || !nat.h) return;
+    const cover = Math.max(sz.w / nat.w, sz.h / nat.h);
+    const want = { w: Math.round(nat.w * cover), h: Math.round(nat.h * cover) };
+    const base = st.imgBases[k];
+    if(!base || Math.abs(base.w - want.w) > 3 || Math.abs(base.h - want.h) > 3){
+      st.imgBases[k] = want;
     }
   });
 }
@@ -2402,25 +2400,35 @@ function promoteFrame(wrap){
 /* 计算图片在 scale=1 时应有的基准尺寸（按原图比例覆盖当前 frame），
    这样 frame 后续 resize 不会改变图片视觉大小。 */
 function computeImgBase(wrap, key, fw, fh){
-  /* ⚠️ 必须同步、确定性（2026-10-13 修）。
-     旧版把整个计算放在 getNaturalSize 的回调里 —— 图片何时加载完不确定，
-     每次刷新 base 的写入时机都不同 → 同一份数据渲染出不同位置（用户反馈
-     "每次刷新图片位置都不一样"）。而且回调里写 state 又触发 applyFrameStyles，
-     形成竞态。
-     现在：基准 = 显示框 ÷ 当前缩放，纯算术、不依赖图片加载、不读 DOM，
-     同样的输入永远得到同样的输出。 */
+  /* imgBases 语义（必须固定不变）：scale=1 时图片按 cover 正好填满显示框的尺寸。
+     imgTx.scale 是用户在此基础上继续放大/缩小的倍数 —— 特写就是靠它实现的。
+     ⚠️ 2026-10-13 教训：曾把 base 改成"等于框"，直接抵消了用户的缩放，
+     特写变全景，用户调好的效果全部失效。base 必须按【原图 cover】算。
+     确定性保证：优先用 imgNaturals 缓存（同步、固定值）；
+     没有缓存才异步取一次 —— 原图尺寸是常量，结果不随刷新时序变化。 */
   const inner = innerOf(wrap);
   if(!inner) return;
-  const sc = ((state.imgTx || {})[key] || {}).scale || 1;
-  const safe = sc > 0.01 ? sc : 1;
-  const base = { w: Math.max(1, Math.round(fw / safe)), h: Math.max(1, Math.round(fh / safe)) };
-  state.imgBases = state.imgBases || {};
-  const prev = state.imgBases[key];
-  if(!prev || prev.w !== base.w || prev.h !== base.h){
-    state.imgBases[key] = base;
-    applyFrameStyles(wrap, key);
-    if(edWrap === wrap) updateTags();
-  }
+  const apply = n => {
+    let base;
+    if(!n || !n.w || !n.h) base = { w: Math.round(fw), h: Math.round(fh) };
+    else{
+      const cover = Math.max(fw / n.w, fh / n.h);
+      base = { w: Math.round(n.w * cover), h: Math.round(n.h * cover) };
+    }
+    state.imgBases = state.imgBases || {};
+    const prev = state.imgBases[key];
+    if(!prev || prev.w !== base.w || prev.h !== base.h){
+      state.imgBases[key] = base;
+      state.imgNaturals = state.imgNaturals || {};
+      if(n && n.w && n.h) state.imgNaturals[key] = { w: n.w, h: n.h };
+      applyFrameStyles(wrap, key);
+      if(edWrap === wrap) updateTags();
+    }
+  };
+  const cached = (state.imgNaturals || {})[key];
+  if(cached && cached.w && cached.h){ apply(cached); return; }   // 同步路径：缓存命中
+  const src = currentImageSrc(inner);
+  getNaturalSize(src, apply);                                     // 异步兜底：只此一次
 }
 
 /* 应用透明度 / 方向渐变透明（通过 CSS mask-image 实现） */
