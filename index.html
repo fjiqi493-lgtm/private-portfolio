@@ -1805,43 +1805,22 @@ function migratePdEn(st){
    sizes 是用户在页面上调好的显示框，imgBases 是图片基准，两者用途不同，
    任何自动互改都是帮倒忙。要改让用户在编辑器里拖。 */
 function migrateImageRatio(st){
-  /* ⚠️ 只修 imgBases，绝不碰 sizes（2026-10-12）。
-     sizes = 用户在页面上调好的显示框（如 690×958 竖构图）—— 用户的构图，不动。
-     imgBases = 图片在 scale=1 时的基准渲染尺寸，它的定义就是"正好填满显示框"。
-     历史上它被记成了原图尺寸（1714×958），于是 background-size:cover 把图放大
-     2.5 倍再裁切 —— 竖构图被硬掰成横构图，线上事故的根因。
-     修法：imgBases 直接等于 sizes（同宽高），cover 时按显示框比例裁切，构图恢复。 */
+  /* ⚠️ 加载时【绝不修改 sizes】（2026-10-13）。
+     sizes 是用户在编辑器里调好的显示框，是用户的构图。
+     旧版在加载时按 imgBases/imgNaturals 去"纠正"它，而 imgBases 本身可能是
+     异步写入的、时序不定 → 每次刷新纠正结果都不同 → 位置随机变（用户反馈）。
+     现在这里只做一件幂等且纯粹的事：保证 imgBases = sizes ÷ scale，
+     让 base × scale 正好覆盖显示框。sizes 一个字都不碰。 */
   if(!st || !st.sizes) return;
   st.imgBases = st.imgBases || {};
   Object.keys(st.sizes).forEach(function(k){
     const sz = st.sizes[k]; if(!sz || !sz.w || !sz.h) return;
-    const base = st.imgBases[k];
-    if(!base) return;
-    /* base × scale 必须正好覆盖显示框 → base = sizes ÷ scale */
+    const base = st.imgBases[k]; if(!base) return;
     const sc = ((st.imgTx || {})[k] || {}).scale || 1;
     const safe = sc > 0.01 ? sc : 1;
     const wantW = Math.round(sz.w / safe), wantH = Math.round(sz.h / safe);
     if(Math.abs(base.w - wantW) > 3 || Math.abs(base.h - wantH) > 3){
       base.w = wantW; base.h = wantH;
-    }
-    /* 若显示框比例与原图比例明显不符（>12%），说明这个框被此前的
-       "按当前框比例锁角点"的 bug 带歪了 —— 横图被存成竖框，cover 后构图全毁。
-       这里按原图比例纠正：宽度不变，高度按 宽 × 原图高/原图宽 重算。
-       （只纠正"被bug 带歪"的，用户主动拖成的异常比例不动 —— 用 imgTx 是否存在来判断：
-        用户主动调整过图片变换时，说明他在精细控制，不干预。） */
-    /* 一次性纠正（2026-10-12）：featuredImg 被此前的 bug 存成了竖框 637×815，
-       而原图是 1800×1006 横图 —— cover 后横图被裁掉 56%，构图全毁。
-       这里直接按原图比例把它纠回 637×357（宽不变，高度按原图比例）。
-       只此一次，下次加载 nat 已记录就走通用逻辑。 */
-    if(k === "images.featuredImg" && !st.__fixedFeatured){
-      st.__fixedFeatured = 1;
-      sz.h = Math.round(sz.w * 1006 / 1800);
-    }
-    const tx0 = (st.imgTx || {})[k];
-    const nat = st.imgNaturals && st.imgNaturals[k];
-    if(!tx0 && nat && nat.w && nat.h){
-      const wantH2 = Math.round(sz.w * nat.h / nat.w);
-      if(Math.abs(sz.h - wantH2) > Math.max(6, sz.h * 0.12)) sz.h = wantH2;
     }
   });
 }
@@ -2162,6 +2141,7 @@ function renderTeam(){
 
 /* ---------- EDIT MODE ---------- */
 function setEditMode(on){
+  if(on) resetHistory();   // 每次进入编辑态都是全新会话，历史不跨页面继承
   editMode = on;
   document.body.classList.toggle("edit", on);
   const btn = document.getElementById("btnToggle");
@@ -2422,27 +2402,25 @@ function promoteFrame(wrap){
 /* 计算图片在 scale=1 时应有的基准尺寸（按原图比例覆盖当前 frame），
    这样 frame 后续 resize 不会改变图片视觉大小。 */
 function computeImgBase(wrap, key, fw, fh){
+  /* ⚠️ 必须同步、确定性（2026-10-13 修）。
+     旧版把整个计算放在 getNaturalSize 的回调里 —— 图片何时加载完不确定，
+     每次刷新 base 的写入时机都不同 → 同一份数据渲染出不同位置（用户反馈
+     "每次刷新图片位置都不一样"）。而且回调里写 state 又触发 applyFrameStyles，
+     形成竞态。
+     现在：基准 = 显示框 ÷ 当前缩放，纯算术、不依赖图片加载、不读 DOM，
+     同样的输入永远得到同样的输出。 */
   const inner = innerOf(wrap);
   if(!inner) return;
-  const src = currentImageSrc(inner);
-  getNaturalSize(src, n=>{
-    let base;
-    if(!n || !n.w || !n.h) base = { w: Math.round(fw), h: Math.round(fh) };
-    else{
-      /* ⚠️ 基准尺寸的定义是"scale=1 时图片正好填满显示框"，所以必须按【显示框】算，
-         不是按原图算。按原图算会得到 1458×815 这种比框大 2.3 倍的基准，
-         再乘上用户的 imgTx.scale(1.21) → 图片被放到 1764×986，被框 cover 裁掉一大半，
-         用户在编辑器里调好的构图，一上传就毁（2026-10-12 线上事故）。
-         正确做法：基准 = 显示框 ÷ 当前缩放，这样 base × scale 始终正好覆盖框。 */
-      const sc = ((state.imgTx || {})[key] || {}).scale || 1;
-      const safe = sc > 0.01 ? sc : 1;
-      base = { w: Math.round(fw / safe), h: Math.round(fh / safe) };
-    }
-    state.imgBases = state.imgBases || {};
+  const sc = ((state.imgTx || {})[key] || {}).scale || 1;
+  const safe = sc > 0.01 ? sc : 1;
+  const base = { w: Math.max(1, Math.round(fw / safe)), h: Math.max(1, Math.round(fh / safe)) };
+  state.imgBases = state.imgBases || {};
+  const prev = state.imgBases[key];
+  if(!prev || prev.w !== base.w || prev.h !== base.h){
     state.imgBases[key] = base;
     applyFrameStyles(wrap, key);
     if(edWrap === wrap) updateTags();
-  });
+  }
 }
 
 /* 应用透明度 / 方向渐变透明（通过 CSS mask-image 实现） */
@@ -4248,6 +4226,15 @@ function finalizePlace(e){
 
 /* --- history (undo / redo) --- */
 let history = [], histIdx = -1;
+const HIST_KEY = "yuhelin-history-v1";
+/* 历史只属于"当前这次编辑会话"：进编辑态/打开页面时清空，
+   绝不复用上个页面（或上次关闭前）留下的快照 —— 否则 Ctrl+Z 会把
+   早已无关的旧状态撤回来，用户完全无法预期（2026-10-13 反馈）。
+   同时也清掉 localStorage 里的旧历史，做到"删除历史记录"就是真的删干净。 */
+function resetHistory(){
+  history = []; histIdx = -1;
+  try{ localStorage.removeItem(HIST_KEY); }catch(e){}
+}
 function snapshot(){ return JSON.parse(JSON.stringify(state)); }
 function pushHistory(){
   const snap = snapshot();
